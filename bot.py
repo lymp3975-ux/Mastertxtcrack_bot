@@ -1,7 +1,5 @@
 import asyncio
 import os
-import asyncio
-import os
 import mmap
 import concurrent.futures
 import aiohttp
@@ -236,13 +234,16 @@ async def done_command(client: Client, message: Message):
     user_id = message.from_user.id
     state_data = user_states.get(user_id, {})
     
+    # Check if we're in URL collection mode
     if state_data.get("state") == "awaiting_urls":
         urls = state_data.get("urls", [])
         
         if urls:
+            # Move to terms collection
             user_states[user_id] = {
                 "state": "awaiting_terms",
                 "urls": urls,
+                "terms": [],
                 "mode": "multi_both"
             }
             
@@ -258,8 +259,35 @@ async def done_command(client: Client, message: Message):
             )
         else:
             await message.reply("❌ No URLs received. Send links first.")
+    
+    # Check if we're in terms collection mode
+    elif state_data.get("state") == "awaiting_terms":
+        terms = state_data.get("terms", [])
+        urls = state_data.get("urls", [])
+        
+        if terms:
+            # START THE SEARCH!
+            await message.reply(
+                f"✅ Received {len(terms)} search terms\n\n"
+                f"📁 Files: {len(urls)}\n"
+                f"🔍 Terms: {len(terms)}\n"
+                f"🔢 Total searches: {len(urls)} × {len(terms)} = {len(urls) * len(terms)}\n\n"
+                "⚡ Starting search... This may take a while."
+            )
+            
+            # Clear the state before processing
+            user_states.pop(user_id, None)
+            
+            # Start the multi-search
+            await process_multi_search(client, message, urls, terms)
+        else:
+            await message.reply("❌ No search terms received. Send terms first.")
+    
     else:
-        await message.reply("No pending URLs.")
+        await message.reply(
+            "ℹ️ No pending operation.\n\n"
+            "Use /multisearch to start a new multi-file search."
+        )
 
 @app.on_message(filters.command("clean"))
 async def clean_command(client: Client, message: Message):
@@ -310,6 +338,10 @@ async def status_command(client: Client, message: Message):
 async def handle_messages(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
         await message.reply("❌ Unauthorized")
+        return
+    
+    # Don't process if it's a command
+    if message.text.startswith('/'):
         return
     
     user_id = message.from_user.id
@@ -477,7 +509,8 @@ async def process_multi_search(client, message, urls, terms):
                 
                 if matches_count > 0:
                     # Create combined output file
-                    output_path = TEMP_DIR / f"results_{message.from_user.id}_{timestamp}_file{file_idx}_term_{term[:20]}.txt"
+                    safe_term = term.replace('/', '_').replace('\\', '_')[:20]
+                    output_path = TEMP_DIR / f"results_{message.from_user.id}_{timestamp}_file{file_idx}_term_{safe_term}.txt"
                     
                     # Write header
                     header = f"=== File {file_idx}: {urls[file_idx-1]} ===\n"
