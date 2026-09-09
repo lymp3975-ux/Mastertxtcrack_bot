@@ -13,6 +13,7 @@ import multiprocessing as mp
 from typing import List, Tuple, Dict
 import re
 import json
+import time
 
 # Configuration from Railway
 API_ID = os.environ.get("API_ID")
@@ -21,10 +22,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
 # Performance settings
-CHUNK_SIZE = 64 * 1024 * 1024  # 64MB chunks
-MAX_WORKERS = mp.cpu_count()
-READ_BUFFER = 1024 * 1024
+CHUNK_SIZE = 128 * 1024 * 1024  # 128MB chunks for better performance
+MAX_WORKERS = min(mp.cpu_count(), 8)  # Limit to avoid overload
+READ_BUFFER = 2 * 1024 * 1024  # 2MB buffer
 MAX_FILE_AGE = 3600  # 1 hour in seconds
+MAX_RESULT_LINES = 100000  # Max lines per result file
 
 app = Client(
     "file_search_bot",
@@ -38,6 +40,7 @@ TEMP_DIR = Path("/tmp/file_search")
 TEMP_DIR.mkdir(exist_ok=True)
 
 user_states = {}
+search_progress = {}  # Track progress for each user
 
 class FileCleaner:
     @staticmethod
@@ -74,32 +77,40 @@ class FastFileSearcher:
         matches = []
         search_bytes = search_term.encode('utf-8', errors='ignore')
         
-        with open(self.file_path, 'rb') as f:
-            mm = mmap.mmap(f.fileno(), chunk_size, offset=chunk_start, access=mmap.ACCESS_READ)
-            try:
-                pos = 0
-                while True:
-                    pos = mm.find(search_bytes, pos)
-                    if pos == -1:
-                        break
-                    
-                    line_start = mm.rfind(b'\n', 0, pos) + 1
-                    line_end = mm.find(b'\n', pos)
-                    if line_end == -1:
-                        line_end = chunk_size
-                    
-                    line = mm[line_start:line_end]
-                    matches.append(line)
-                    pos = line_end + 1
-                    
-                    if len(matches) >= 10000:
-                        break
-            finally:
-                mm.close()
+        try:
+            with open(self.file_path, 'rb') as f:
+                # Use memory mapping for large files
+                mm = mmap.mmap(f.fileno(), chunk_size, offset=chunk_start, access=mmap.ACCESS_READ)
+                try:
+                    pos = 0
+                    match_count = 0
+                    while True:
+                        pos = mm.find(search_bytes, pos)
+                        if pos == -1:
+                            break
+                        
+                        # Find line boundaries
+                        line_start = mm.rfind(b'\n', 0, pos) + 1
+                        line_end = mm.find(b'\n', pos)
+                        if line_end == -1:
+                            line_end = chunk_size
+                        
+                        line = mm[line_start:line_end]
+                        matches.append(line)
+                        match_count += 1
+                        pos = line_end + 1
+                        
+                        # Limit matches per chunk to avoid memory issues
+                        if match_count >= 50000:
+                            break
+                finally:
+                    mm.close()
+        except Exception as e:
+            print(f"Search error in chunk: {e}")
         
         return len(matches), matches
     
-    async def search_parallel(self, search_term: str) -> Tuple[int, List[bytes]]:
+    async def search_parallel(self, search_term: str, progress_callback=None) -> Tuple[int, List[bytes]]:
         all_matches = []
         total_matches = 0
         
@@ -109,25 +120,21 @@ class FastFileSearcher:
             chunk_size = min(CHUNK_SIZE, self.file_size - chunk_start)
             chunk_tasks.append((chunk_start, chunk_size, search_term))
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Process chunks in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, self.num_chunks)) as executor:
             futures = [executor.submit(self.search_chunk, task) for task in chunk_tasks]
             
+            completed = 0
             for future in concurrent.futures.as_completed(futures):
                 matches_count, matches = future.result()
                 total_matches += matches_count
                 all_matches.extend(matches)
+                completed += 1
+                
+                if progress_callback:
+                    await progress_callback(completed, self.num_chunks)
         
         return total_matches, all_matches
-    
-    async def search_multiple_terms(self, search_terms: List[str]) -> Dict[str, Tuple[int, List[bytes]]]:
-        """Search for multiple terms in the same file"""
-        results = {}
-        
-        for term in search_terms:
-            matches_count, matches = await self.search_parallel(term)
-            results[term] = (matches_count, matches)
-        
-        return results
 
 class FastDownloader:
     @staticmethod
@@ -136,10 +143,11 @@ class FastDownloader:
             limit=10,
             limit_per_host=5,
             ttl_dns_cache=300,
-            use_dns_cache=True
+            use_dns_cache=True,
+            force_close=True
         )
         
-        timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=60)
+        timeout = aiohttp.ClientTimeout(total=3600, connect=60, sock_read=120)
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.get(url, allow_redirects=True) as response:
@@ -157,7 +165,7 @@ class FastDownloader:
                         
                         if progress_callback and total_size > 0:
                             percent = (downloaded / total_size) * 100
-                            if percent - last_update >= 2:
+                            if percent - last_update >= 5:  # Update every 5%
                                 await progress_callback(downloaded, total_size)
                                 last_update = percent
 
@@ -181,7 +189,8 @@ async def start_command(client: Client, message: Message):
         "• Multiple terms search\n"
         "• Combined multi-file + multi-term\n"
         "• Memory-mapped parallel engine\n"
-        "• Auto-delete old files\n\n"
+        "• Auto-delete old files\n"
+        "• Live progress updates\n\n"
         "**Commands:**\n"
         "/search - Single search\n"
         "/multisearch - Multi files + terms\n"
@@ -267,12 +276,15 @@ async def done_command(client: Client, message: Message):
         
         if terms:
             # START THE SEARCH!
+            total_searches = len(urls) * len(terms)
+            
             await message.reply(
                 f"✅ Received {len(terms)} search terms\n\n"
                 f"📁 Files: {len(urls)}\n"
                 f"🔍 Terms: {len(terms)}\n"
-                f"🔢 Total searches: {len(urls)} × {len(terms)} = {len(urls) * len(terms)}\n\n"
-                "⚡ Starting search... This may take a while."
+                f"🔢 Total searches: {len(urls)} × {len(terms)} = {total_searches}\n\n"
+                "⚡ Starting search... This may take a while.\n"
+                "📊 Progress will be shown live."
             )
             
             # Clear the state before processing
@@ -331,7 +343,9 @@ async def status_command(client: Client, message: Message):
         f"📁 **Temp Files:** {len(temp_files)}\n"
         f"💾 **Temp Size:** {total_size / (1024*1024):.1f}MB\n"
         f"⚡ **Engine:** Memory-mapped parallel\n"
-        f"🗑 **Auto-delete:** 1 hour"
+        f"🗑 **Auto-delete:** 1 hour\n"
+        f"📦 **Chunk Size:** 128MB\n"
+        f"🔢 **Max Workers:** {MAX_WORKERS}"
     )
 
 @app.on_message(filters.text & filters.private)
@@ -419,29 +433,53 @@ async def process_single_search(client, message, url, search_term):
         downloader = FastDownloader()
         async def download_progress(downloaded, total):
             percent = (downloaded / total) * 100
-            await status_msg.edit_text(
-                f"⬇️ **Downloading:** {percent:.1f}%\n"
-                f"📦 {downloaded / (1024*1024):.1f}MB / {total / (1024*1024):.1f}MB"
-            )
+            try:
+                await status_msg.edit_text(
+                    f"⬇️ **Downloading:** {percent:.1f}%\n"
+                    f"📦 {downloaded / (1024*1024):.1f}MB / {total / (1024*1024):.1f}MB"
+                )
+            except:
+                pass
         
         await downloader.download_with_progress(url, download_path, download_progress)
         
         # Search
         await status_msg.edit_text("🔍 Searching...")
         searcher = FastFileSearcher(str(download_path))
+        
+        async def search_progress(completed, total):
+            try:
+                await status_msg.edit_text(
+                    f"🔍 **Searching...**\n"
+                    f"📊 Progress: {completed}/{total} chunks"
+                )
+            except:
+                pass
+        
         start_time = datetime.now()
-        matches_count, matches = await searcher.search_parallel(search_term)
+        matches_count, matches = await searcher.search_parallel(search_term, search_progress)
         search_time = (datetime.now() - start_time).total_seconds()
         
         if matches_count > 0:
             async with aiofiles.open(output_path, 'wb') as f:
-                for match in matches[:100000]:
+                for match in matches[:MAX_RESULT_LINES]:
                     await f.write(match + b'\n')
             
-            await message.reply_document(
-                output_path,
-                caption=f"📄 Found {matches_count:,} matches\n⚡ {search_time:.2f}s"
-            )
+            # Send in smaller chunks if file is large
+            file_size = os.path.getsize(output_path)
+            if file_size > 40 * 1024 * 1024:  # >40MB
+                parts = split_file(output_path, 40 * 1024 * 1024)
+                for part_idx, part_path in enumerate(parts, 1):
+                    await message.reply_document(
+                        part_path,
+                        caption=f"📄 Part {part_idx}/{len(parts)} | {matches_count:,} matches\n⚡ {search_time:.2f}s"
+                    )
+                    asyncio.create_task(FileCleaner.schedule_deletion(part_path, 300))
+            else:
+                await message.reply_document(
+                    output_path,
+                    caption=f"📄 Found {matches_count:,} matches\n⚡ {search_time:.2f}s"
+                )
             
             asyncio.create_task(FileCleaner.schedule_deletion(output_path, 300))
         else:
@@ -454,12 +492,13 @@ async def process_single_search(client, message, url, search_term):
         await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 async def process_multi_search(client, message, urls, terms):
-    """Multiple files + Multiple terms"""
+    """Multiple files + Multiple terms with live progress"""
     total_files = len(urls)
     total_terms = len(terms)
     total_searches = total_files * total_terms
     
-    status_msg = await message.reply(
+    # Create a unique progress message
+    progress_msg = await message.reply(
         f"⚡ **MULTI-SEARCH STARTED**\n\n"
         f"📁 Files: {total_files}\n"
         f"🔍 Terms: {total_terms}\n"
@@ -472,13 +511,14 @@ async def process_multi_search(client, message, urls, terms):
         downloaded_files = []
         downloader = FastDownloader()
         
-        # Download all files
+        # Download all files with progress
         for i, url in enumerate(urls, 1):
             download_path = TEMP_DIR / f"download_{message.from_user.id}_{timestamp}_file{i}.txt"
             
-            await status_msg.edit_text(
+            await progress_msg.edit_text(
                 f"⬇️ **Downloading file {i}/{total_files}**\n"
-                f"📦 Size: {i}/{total_files}"
+                f"📊 Progress: {i}/{total_files}\n"
+                f"📁 File: {url[:50]}..."
             )
             
             await downloader.download_with_progress(url, download_path)
@@ -494,22 +534,25 @@ async def process_multi_search(client, message, urls, terms):
         for file_idx, file_path in downloaded_files:
             searcher = FastFileSearcher(str(file_path))
             
-            for term in terms:
+            for term_idx, term in enumerate(terms, 1):
                 search_count += 1
                 
-                await status_msg.edit_text(
+                # Update progress
+                await progress_msg.edit_text(
                     f"🔍 **Searching...**\n\n"
                     f"📁 File: {file_idx}/{total_files}\n"
                     f"🔍 Term: '{term}'\n"
-                    f"📊 Progress: {search_count}/{total_searches}"
+                    f"📊 Overall: {search_count}/{total_searches}\n"
+                    f"📈 Term: {term_idx}/{total_terms}\n"
+                    f"⏳ Please wait..."
                 )
                 
                 matches_count, matches = await searcher.search_parallel(term)
                 total_matches_all += matches_count
                 
                 if matches_count > 0:
-                    # Create combined output file
-                    safe_term = term.replace('/', '_').replace('\\', '_')[:20]
+                    # Create output file
+                    safe_term = term.replace('/', '_').replace('\\', '_').replace(':', '_')[:30]
                     output_path = TEMP_DIR / f"results_{message.from_user.id}_{timestamp}_file{file_idx}_term_{safe_term}.txt"
                     
                     # Write header
@@ -517,44 +560,70 @@ async def process_multi_search(client, message, urls, terms):
                     header += f"=== Search Term: {term} ===\n"
                     header += f"=== Matches: {matches_count} ===\n\n"
                     
-                    async with aiofiles.open(output_path, 'wb') as f:
-                        await f.write(header.encode('utf-8'))
-                        for match in matches[:50000]:  # Limit per term
-                            await f.write(match + b'\n')
-                    
-                    file_size = os.path.getsize(output_path)
-                    
-                    if file_size > 49 * 1024 * 1024:
-                        # Split if too large
-                        parts = split_file(output_path, 49 * 1024 * 1024)
-                        for part_idx, part_path in enumerate(parts, 1):
-                            await message.reply_document(
-                                part_path,
-                                caption=f"📄 File {file_idx} | Term '{term}' | Part {part_idx}/{len(parts)} | {matches_count:,} matches"
-                            )
-                            asyncio.create_task(FileCleaner.schedule_deletion(part_path, 300))
-                    else:
-                        await message.reply_document(
-                            output_path,
-                            caption=f"📄 File {file_idx} | Term '{term}' | {matches_count:,} matches"
-                        )
-                    
-                    asyncio.create_task(FileCleaner.schedule_deletion(output_path, 600))
+                    try:
+                        async with aiofiles.open(output_path, 'wb') as f:
+                            await f.write(header.encode('utf-8'))
+                            for match in matches[:MAX_RESULT_LINES]:
+                                await f.write(match + b'\n')
+                        
+                        file_size = os.path.getsize(output_path)
+                        
+                        # Send file in parts if too large
+                        if file_size > 40 * 1024 * 1024:  # >40MB
+                            parts = split_file(output_path, 40 * 1024 * 1024)
+                            for part_idx, part_path in enumerate(parts, 1):
+                                try:
+                                    await message.reply_document(
+                                        part_path,
+                                        caption=f"📄 File {file_idx} | '{term}' | Part {part_idx}/{len(parts)} | {matches_count:,} matches"
+                                    )
+                                except Exception as e:
+                                    await message.reply(f"⚠️ Error sending part {part_idx}: {str(e)}")
+                                asyncio.create_task(FileCleaner.schedule_deletion(part_path, 300))
+                        else:
+                            try:
+                                await message.reply_document(
+                                    output_path,
+                                    caption=f"📄 File {file_idx} | '{term}' | {matches_count:,} matches"
+                                )
+                            except Exception as e:
+                                await message.reply(f"⚠️ Error sending results for '{term}': {str(e)}")
+                        
+                        asyncio.create_task(FileCleaner.schedule_deletion(output_path, 600))
+                    except Exception as e:
+                        await message.reply(f"⚠️ Error creating results for '{term}': {str(e)}")
                 else:
-                    await message.reply(f"❌ File {file_idx} | Term '{term}': No matches")
+                    try:
+                        await message.reply(f"❌ File {file_idx} | '{term}': No matches")
+                    except:
+                        pass
+                
+                # Update progress after each term
+                await progress_msg.edit_text(
+                    f"🔍 **Searching...**\n\n"
+                    f"📁 File: {file_idx}/{total_files}\n"
+                    f"🔍 Term: '{term}' - ✅ Done\n"
+                    f"📊 Overall: {search_count}/{total_searches}\n"
+                    f"📈 Found: {matches_count:,} matches"
+                )
         
         # Final summary
-        await status_msg.edit_text(
+        await progress_msg.edit_text(
             f"✅ **SEARCH COMPLETE**\n\n"
             f"📁 Files processed: {total_files}\n"
             f"🔍 Terms searched: {total_terms}\n"
             f"🔢 Total searches: {total_searches}\n"
             f"📊 Total matches: {total_matches_all:,}\n\n"
-            f"🗑 Files will auto-delete in 30 minutes"
+            f"🗑 Files will auto-delete in 30 minutes\n"
+            f"📦 All results sent successfully!"
         )
         
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        error_msg = f"❌ Error: {str(e)}"
+        try:
+            await progress_msg.edit_text(error_msg)
+        except:
+            await message.reply(error_msg)
 
 @app.on_callback_query()
 async def handle_callback(client, callback_query):
@@ -611,34 +680,42 @@ async def handle_callback(client, callback_query):
             f"💿 **Free Disk:** {free_space:.1f}GB\n"
             f"📁 **Temp Files:** {len(temp_files)}\n"
             f"💾 **Temp Size:** {total_size / (1024*1024):.1f}MB\n"
-            f"🗑 **Auto-delete:** 1 hour"
+            f"🗑 **Auto-delete:** 1 hour\n"
+            f"📦 **Max File Size:** Unlimited\n"
+            f"📊 **Max Results per file:** {MAX_RESULT_LINES:,}"
         )
     
     await callback_query.answer()
 
 def split_file(file_path: Path, max_size: int) -> List[Path]:
+    """Split large file into smaller parts"""
     parts = []
     file_size = os.path.getsize(file_path)
     num_parts = (file_size + max_size - 1) // max_size
     
-    with open(file_path, 'rb') as f:
-        for i in range(num_parts):
-            part_path = file_path.parent / f"{file_path.stem}_part{i+1}.txt"
-            with open(part_path, 'wb') as part_file:
-                remaining = min(max_size, file_size - i * max_size)
-                while remaining > 0:
-                    chunk = f.read(min(READ_BUFFER, remaining))
-                    if not chunk:
-                        break
-                    part_file.write(chunk)
-                    remaining -= len(chunk)
-            parts.append(part_path)
+    try:
+        with open(file_path, 'rb') as f:
+            for i in range(num_parts):
+                part_path = file_path.parent / f"{file_path.stem}_part{i+1}.txt"
+                with open(part_path, 'wb') as part_file:
+                    remaining = min(max_size, file_size - i * max_size)
+                    while remaining > 0:
+                        chunk = f.read(min(READ_BUFFER, remaining))
+                        if not chunk:
+                            break
+                        part_file.write(chunk)
+                        remaining -= len(chunk)
+                parts.append(part_path)
+    except Exception as e:
+        print(f"Error splitting file: {e}")
     
     return parts
 
 if __name__ == "__main__":
     print("⚡ Ultimate Multi-File Search Bot starting...")
     print(f"CPU Cores: {mp.cpu_count()}")
+    print(f"Max Workers: {MAX_WORKERS}")
+    print(f"Chunk Size: {CHUNK_SIZE / (1024*1024):.0f}MB")
     print(f"Auto-delete: Files older than {MAX_FILE_AGE/60:.0f} minutes")
     
     # Start cleanup task
