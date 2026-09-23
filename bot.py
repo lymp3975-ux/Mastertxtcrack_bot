@@ -351,29 +351,41 @@ async def run_search_on_files(client, message, entries: List[Tuple[int, Path, st
 async def cmd_start(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
         return await message.reply("❌ Unauthorized")
+    
+    # Premium UI Layout
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 New Search (URL)", callback_data="single"),
-         InlineKeyboardButton("📁 Multi Files + Terms", callback_data="multi_both")],
+        # Core Search
+        [InlineKeyboardButton("🔍 Single Search", callback_data="single"),
+         InlineKeyboardButton("📁 Multi Search", callback_data="multi_both")],
+        
+        # Library Management
         [InlineKeyboardButton("🗂 Saved Files", callback_data="list_files"),
-         InlineKeyboardButton("♻️ Recheck Saved", callback_data="recheck_menu")],
-        [InlineKeyboardButton("📜 History", callback_data="history"),
-         InlineKeyboardButton("🧹 Clean Results", callback_data="clean")],
-        [InlineKeyboardButton("📊 Status", callback_data="status")],
+         InlineKeyboardButton("🌐 Search All Saved", callback_data="allfiles")],
+        
+        # Recheck & History
+        [InlineKeyboardButton("♻️ Recheck File", callback_data="recheck_menu"),
+         InlineKeyboardButton("📜 Search History", callback_data="history")],
+        
+        # System
+        [InlineKeyboardButton("🧹 Clean Results", callback_data="clean"),
+         InlineKeyboardButton("📊 System Status", callback_data="status")]
     ])
+    
     await message.reply(
-        "⚡ **Persistent File Search Bot**\n\n"
-        "• Files saved forever (no auto-delete)\n"
-        "• Re-search saved files instantly (no redownload)\n"
-        "• Results delivered as ZIP\n\n"
-        "**Commands:**\n"
-        "/search — Single URL search\n"
-        "/multisearch — Multi files + multi terms\n"
-        "/files — List saved files\n"
-        "/recheck — Re-search a saved file\n"
-        "/allfiles — Search ALL saved files\n"
-        "/history — View search history\n"
-        "/clean — Clean results\n"
-        "/status — System status",
+        "✨ **Premium Persistent File Search Bot** ✨\n\n"
+        "Welcome to your personal search engine! Files are saved forever, meaning you never have to download the same URL twice.\n\n"
+        "🚀 **Core Commands:**\n"
+        "• `/search` — Search a single URL\n"
+        "• `/multisearch` — Search multiple files with multiple terms\n"
+        "• `/allfiles` — Search across EVERY saved file\n\n"
+        "🗂 **Library Management:**\n"
+        "• `/files` — List all saved files\n"
+        "• `/recheck` — Re-search a specific saved file\n"
+        "• `/history` — View recent searches\n\n"
+        "⚙️ **System:**\n"
+        "• `/clean` — Clean result files (sources preserved)\n"
+        "• `/status` — Bot stats & storage\n\n"
+        "👇 **Use the buttons below for quick access:**",
         reply_markup=kb
     )
 
@@ -665,6 +677,16 @@ async def on_cb(client: Client, q: CallbackQuery):
                 ok = "✅" if Path(m["path"]).exists() else "❌"
                 lines.append(f"{ok} `{fid}` | {m['name']} | {human_size(m.get('size',0))}")
             await q.message.reply("\n".join(lines))
+    elif d == "allfiles":
+        files = Registry.all_files()
+        if not files:
+            await q.message.reply("📂 No saved files.")
+        else:
+            user_states[uid] = {
+                "state": "awaiting_terms_allfiles", "file_ids": list(files.keys()),
+                "terms": [], "mode": "allfiles"
+            }
+            await q.message.reply(f"🌐 Search across ALL {len(files)} saved files.\nSend terms, then /done")
     elif d == "recheck_menu":
         files = Registry.all_files()
         if not files:
