@@ -24,7 +24,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
 # Detect Railway persistent volume (mount at /data)
-# If RAILWAY_VOLUME_MOUNT_PATH is set, use it; else fallback to /tmp
 BASE_DIR = Path(
     os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
     or os.environ.get("DATA_DIR")
@@ -487,11 +486,50 @@ async def cmd_status(client: Client, message: Message):
         f"🗑 Auto-delete: OFF"
     )
 
-# ================= MESSAGE HANDLER =================
+# =====================================================================
+# IMPORTANT: /done handler MUST be defined BEFORE the generic text handler
+# otherwise the generic handler intercepts the /done command and stops it.
+# =====================================================================
+@app.on_message(filters.command("done"))
+async def cmd_done(client: Client, message: Message):
+    if message.from_user.id != ALLOWED_USER_ID:
+        return await message.reply("❌ Unauthorized")
+    uid = message.from_user.id
+    sd = user_states.get(uid, {})
+    state = sd.get("state")
+
+    if state == "awaiting_urls":
+        urls = sd.get("urls", [])
+        if not urls:
+            return await message.reply("❌ No URLs.")
+        user_states[uid] = {"state": "awaiting_terms", "urls": urls, "terms": [], "mode": "multi_both"}
+        return await message.reply(f"✅ {len(urls)} files.\n\nSend search terms (one per line), /done when finished.")
+
+    if state == "awaiting_terms":
+        terms = sd.get("terms", [])
+        urls = sd.get("urls", [])
+        if not terms:
+            return await message.reply("❌ No terms.")
+        user_states.pop(uid, None)
+        return await process_multi(client, message, urls, terms)
+
+    if state in ("awaiting_terms_for_recheck", "awaiting_terms_allfiles"):
+        terms = sd.get("terms", [])
+        file_ids = sd.get("file_ids", [])
+        if not terms:
+            return await message.reply("❌ No terms.")
+        user_states.pop(uid, None)
+        return await process_saved_batch(client, message, file_ids, terms)
+
+    await message.reply("ℹ️ Nothing pending.")
+
+# ================= MESSAGE HANDLER (Generic Text) =================
 @app.on_message(filters.text & filters.private)
 async def handle_text(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
         return await message.reply("❌ Unauthorized")
+    
+    # Ignore any command messages that were not caught by command handlers
     if message.text.startswith("/"):
         return
 
@@ -542,40 +580,6 @@ async def handle_text(client: Client, message: Message):
             await process_single_saved(client, message, sd["file_id"], term)
         else:
             await process_single(client, message, sd["url"], term)
-
-# ================= DONE HANDLER =================
-@app.on_message(filters.command("done"))
-async def cmd_done(client: Client, message: Message):
-    if message.from_user.id != ALLOWED_USER_ID:
-        return await message.reply("❌ Unauthorized")
-    uid = message.from_user.id
-    sd = user_states.get(uid, {})
-    state = sd.get("state")
-
-    if state == "awaiting_urls":
-        urls = sd.get("urls", [])
-        if not urls:
-            return await message.reply("❌ No URLs.")
-        user_states[uid] = {"state": "awaiting_terms", "urls": urls, "terms": [], "mode": "multi_both"}
-        return await message.reply(f"✅ {len(urls)} files.\n\nSend search terms (one per line), /done when finished.")
-
-    if state == "awaiting_terms":
-        terms = sd.get("terms", [])
-        urls = sd.get("urls", [])
-        if not terms:
-            return await message.reply("❌ No terms.")
-        user_states.pop(uid, None)
-        return await process_multi(client, message, urls, terms)
-
-    if state in ("awaiting_terms_for_recheck", "awaiting_terms_allfiles"):
-        terms = sd.get("terms", [])
-        file_ids = sd.get("file_ids", [])
-        if not terms:
-            return await message.reply("❌ No terms.")
-        user_states.pop(uid, None)
-        return await process_saved_batch(client, message, file_ids, terms)
-
-    await message.reply("ℹ️ Nothing pending.")
 
 # ================= PROCESSORS =================
 async def process_single(client, message, url, term):
