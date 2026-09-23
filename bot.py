@@ -1,725 +1,720 @@
 import asyncio
 import os
 import mmap
+import hashlib
 import concurrent.futures
 import aiohttp
 import aiofiles
-import tempfile
-from datetime import datetime, timedelta
+import zipfile
+import shutil
+from datetime import datetime
 from pathlib import Path
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import multiprocessing as mp
-from typing import List, Tuple, Dict
-import re
+from typing import List, Tuple, Dict, Optional
 import json
-import time
+import re
+import uuid
 
-# Configuration from Railway
-API_ID = os.environ.get("API_ID")
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# ================= CONFIG (Railway Environment Variables) =================
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
-# Performance settings
-CHUNK_SIZE = 128 * 1024 * 1024  # 128MB chunks for better performance
-MAX_WORKERS = min(mp.cpu_count(), 8)  # Limit to avoid overload
-READ_BUFFER = 2 * 1024 * 1024  # 2MB buffer
-MAX_FILE_AGE = 3600  # 1 hour in seconds
-MAX_RESULT_LINES = 100000  # Max lines per result file
+# Detect Railway persistent volume (mount at /data)
+# If RAILWAY_VOLUME_MOUNT_PATH is set, use it; else fallback to /tmp
+BASE_DIR = Path(
+    os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    or os.environ.get("DATA_DIR")
+    or "/tmp/file_search"
+)
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
+FILES_DIR   = BASE_DIR / "files"
+RESULTS_DIR = BASE_DIR / "results"
+ZIP_DIR     = BASE_DIR / "zips"
+META_DIR    = BASE_DIR / "meta"
+for d in (FILES_DIR, RESULTS_DIR, ZIP_DIR, META_DIR):
+    d.mkdir(exist_ok=True)
+
+REGISTRY_FILE  = META_DIR / "registry.json"
+HISTORY_FILE   = META_DIR / "history.json"
+BOOKMARKS_FILE = META_DIR / "bookmarks.json"
+
+# ================= PERFORMANCE =================
+CHUNK_SIZE     = 128 * 1024 * 1024   # 128 MB
+MAX_WORKERS    = min(mp.cpu_count(), 8)
+READ_BUFFER    = 2 * 1024 * 1024
+MAX_RESULT_LINES = 100000
+ZIP_SPLIT_SIZE = 45 * 1024 * 1024
+
+# ================= APP =================
 app = Client(
     "file_search_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=MAX_WORKERS * 2
+    workers=MAX_WORKERS * 2,
+    workdir=str(BASE_DIR),   # session file stored on persistent volume
 )
 
-TEMP_DIR = Path("/tmp/file_search")
-TEMP_DIR.mkdir(exist_ok=True)
+user_states: Dict[int, dict] = {}
 
-user_states = {}
-search_progress = {}  # Track progress for each user
-
-class FileCleaner:
+# ================= REGISTRY (PERSISTENT JSON STORAGE) =================
+class Registry:
     @staticmethod
-    async def cleanup_old_files():
-        """Auto-delete old files"""
-        while True:
+    def _load(path: Path) -> dict:
+        if path.exists():
             try:
-                current_time = datetime.now().timestamp()
-                for file in TEMP_DIR.iterdir():
-                    if file.is_file():
-                        file_age = current_time - file.stat().st_mtime
-                        if file_age > MAX_FILE_AGE:
-                            file.unlink(missing_ok=True)
-                            print(f"🗑 Auto-deleted: {file.name}")
-            except Exception as e:
-                print(f"Cleanup error: {e}")
-            await asyncio.sleep(300)  # Every 5 minutes
-    
-    @staticmethod
-    async def schedule_deletion(file_path: Path, delay_seconds: int = 600):
-        """Schedule file deletion"""
-        await asyncio.sleep(delay_seconds)
-        file_path.unlink(missing_ok=True)
-        print(f"🗑 Scheduled deletion: {file_path.name}")
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
 
+    @staticmethod
+    def _save(path: Path, data: dict):
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(path)
+
+    @staticmethod
+    def all_files() -> dict:
+        return Registry._load(REGISTRY_FILE)
+
+    @staticmethod
+    def add_file(file_id: str, meta: dict):
+        data = Registry._load(REGISTRY_FILE)
+        data[file_id] = meta
+        Registry._save(REGISTRY_FILE, data)
+
+    @staticmethod
+    def get_file(file_id: str) -> Optional[dict]:
+        return Registry._load(REGISTRY_FILE).get(file_id)
+
+    @staticmethod
+    def find_by_url(url: str) -> Optional[Tuple[str, dict]]:
+        for fid, meta in Registry._load(REGISTRY_FILE).items():
+            if meta.get("url") == url:
+                return fid, meta
+        return None
+
+    @staticmethod
+    def find_by_name(name: str) -> Optional[Tuple[str, dict]]:
+        for fid, meta in Registry._load(REGISTRY_FILE).items():
+            if meta.get("name", "").lower() == name.lower():
+                return fid, meta
+        return None
+
+    @staticmethod
+    def add_history(entry: dict):
+        data = Registry._load(HISTORY_FILE)
+        entry["id"] = str(uuid.uuid4())[:8]
+        entry["time"] = datetime.now().isoformat()
+        data[entry["id"]] = entry
+        if len(data) > 500:
+            for k in list(data.keys())[:-500]:
+                del data[k]
+        Registry._save(HISTORY_FILE, data)
+        return entry["id"]
+
+    @staticmethod
+    def all_history() -> dict:
+        return Registry._load(HISTORY_FILE)
+
+    @staticmethod
+    def add_bookmark(result_id: str, meta: dict):
+        data = Registry._load(BOOKMARKS_FILE)
+        data[result_id] = meta
+        Registry._save(BOOKMARKS_FILE, data)
+
+    @staticmethod
+    def all_bookmarks() -> dict:
+        return Registry._load(BOOKMARKS_FILE)
+
+# ================= FAST SEARCHER =================
 class FastFileSearcher:
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.file_size = os.path.getsize(file_path)
         self.num_chunks = max(1, (self.file_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
-    
+
     def search_chunk(self, chunk_info: Tuple[int, int, str]) -> Tuple[int, List[bytes]]:
-        chunk_start, chunk_size, search_term = chunk_info
+        chunk_start, chunk_size, term = chunk_info
         matches = []
-        search_bytes = search_term.encode('utf-8', errors='ignore')
-        
+        needle = term.encode("utf-8", errors="ignore")
         try:
-            with open(self.file_path, 'rb') as f:
-                # Use memory mapping for large files
+            with open(self.file_path, "rb") as f:
                 mm = mmap.mmap(f.fileno(), chunk_size, offset=chunk_start, access=mmap.ACCESS_READ)
                 try:
-                    pos = 0
-                    match_count = 0
+                    pos, count = 0, 0
                     while True:
-                        pos = mm.find(search_bytes, pos)
+                        pos = mm.find(needle, pos)
                         if pos == -1:
                             break
-                        
-                        # Find line boundaries
-                        line_start = mm.rfind(b'\n', 0, pos) + 1
-                        line_end = mm.find(b'\n', pos)
-                        if line_end == -1:
-                            line_end = chunk_size
-                        
-                        line = mm[line_start:line_end]
-                        matches.append(line)
-                        match_count += 1
-                        pos = line_end + 1
-                        
-                        # Limit matches per chunk to avoid memory issues
-                        if match_count >= 50000:
+                        ls = mm.rfind(b"\n", 0, pos) + 1
+                        le = mm.find(b"\n", pos)
+                        if le == -1:
+                            le = chunk_size
+                        line = mm[ls:le]
+                        if len(line) < 5000:
+                            matches.append(line)
+                            count += 1
+                        pos = le + 1
+                        if count >= 50000:
                             break
                 finally:
                     mm.close()
         except Exception as e:
-            print(f"Search error in chunk: {e}")
-        
+            print(f"[chunk err] {e}")
         return len(matches), matches
-    
-    async def search_parallel(self, search_term: str, progress_callback=None) -> Tuple[int, List[bytes]]:
-        all_matches = []
-        total_matches = 0
-        
-        chunk_tasks = []
-        for i in range(self.num_chunks):
-            chunk_start = i * CHUNK_SIZE
-            chunk_size = min(CHUNK_SIZE, self.file_size - chunk_start)
-            chunk_tasks.append((chunk_start, chunk_size, search_term))
-        
-        # Process chunks in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, self.num_chunks)) as executor:
-            futures = [executor.submit(self.search_chunk, task) for task in chunk_tasks]
-            
-            completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                matches_count, matches = future.result()
-                total_matches += matches_count
-                all_matches.extend(matches)
-                completed += 1
-                
-                if progress_callback:
-                    await progress_callback(completed, self.num_chunks)
-        
-        return total_matches, all_matches
 
+    async def search_parallel(self, term: str, progress_cb=None) -> Tuple[int, List[bytes]]:
+        all_matches, total = [], 0
+        tasks = []
+        for i in range(self.num_chunks):
+            start = i * CHUNK_SIZE
+            size = min(CHUNK_SIZE, self.file_size - start)
+            tasks.append((start, size, term))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, self.num_chunks)) as ex:
+            futures = [ex.submit(self.search_chunk, t) for t in tasks]
+            done = 0
+            for fut in concurrent.futures.as_completed(futures):
+                c, m = fut.result()
+                total += c
+                all_matches.extend(m)
+                done += 1
+                if progress_cb:
+                    try:
+                        await progress_cb(done, self.num_chunks)
+                    except Exception:
+                        pass
+        return total, all_matches
+
+# ================= DOWNLOADER =================
 class FastDownloader:
     @staticmethod
-    async def download_with_progress(url: str, dest_path: Path, progress_callback=None):
-        connector = aiohttp.TCPConnector(
-            limit=10,
-            limit_per_host=5,
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-            force_close=True
-        )
-        
-        timeout = aiohttp.ClientTimeout(total=3600, connect=60, sock_read=120)
-        
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with session.get(url, allow_redirects=True) as response:
-                if response.status != 200:
-                    raise Exception(f"Download failed: HTTP {response.status}")
-                
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                last_update = 0
-                
-                async with aiofiles.open(dest_path, 'wb', buffering=READ_BUFFER) as f:
-                    async for chunk in response.content.iter_chunked(READ_BUFFER):
+    async def download(url: str, dest: Path, progress_cb=None):
+        connector = aiohttp.TCPConnector(limit=10, limit_per_host=5, ttl_dns_cache=300,
+                                         use_dns_cache=True, force_close=True)
+        timeout = aiohttp.ClientTimeout(total=7200, connect=60, sock_read=180)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as s:
+            async with s.get(url, allow_redirects=True) as r:
+                if r.status != 200:
+                    raise Exception(f"HTTP {r.status}")
+                total_size = int(r.headers.get("content-length", 0))
+                downloaded, last = 0, 0
+                async with aiofiles.open(dest, "wb", buffering=READ_BUFFER) as f:
+                    async for chunk in r.content.iter_chunked(READ_BUFFER):
                         await f.write(chunk)
                         downloaded += len(chunk)
-                        
-                        if progress_callback and total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            if percent - last_update >= 5:  # Update every 5%
-                                await progress_callback(downloaded, total_size)
-                                last_update = percent
+                        if progress_cb and total_size > 0:
+                            pct = (downloaded / total_size) * 100
+                            if pct - last >= 5:
+                                await progress_cb(downloaded, total_size)
+                                last = pct
+        return dest
 
+# ================= HELPERS =================
+def human_size(b: int) -> str:
+    for u in ["B", "KB", "MB", "GB", "TB"]:
+        if b < 1024:
+            return f"{b:.2f}{u}"
+        b /= 1024
+    return f"{b:.2f}PB"
+
+def file_id_from_url(url: str) -> str:
+    return hashlib.md5(url.encode()).hexdigest()[:16]
+
+def split_file_into_zips(files: List[Path], zip_name: str) -> List[Path]:
+    parts, current_zip, current_size, idx = [], None, 0, 1
+    def open_new():
+        nonlocal current_zip, current_size, idx
+        path = ZIP_DIR / f"{zip_name}_part{idx}.zip"
+        current_zip = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6)
+        parts.append(path)
+        current_size = 0
+        idx += 1
+    open_new()
+    for f in files:
+        if current_size + f.stat().st_size > ZIP_SPLIT_SIZE:
+            current_zip.close()
+            open_new()
+        current_zip.write(f, arcname=f.name)
+        current_size += f.stat().st_size
+    if current_zip:
+        current_zip.close()
+    return parts
+
+async def download_or_reuse(url: str, idx: int, status_msg) -> Tuple[Path, str]:
+    existing = Registry.find_by_url(url)
+    if existing:
+        fid, meta = existing
+        if Path(meta["path"]).exists():
+            return Path(meta["path"]), fid
+
+    fid = file_id_from_url(url) + f"_{idx}"
+    dest = FILES_DIR / f"{fid}.bin"
+
+    async def prog(done, total):
+        try:
+            await status_msg.edit_text(
+                f"⬇️ File {idx}: {(done/total)*100:.1f}%\n"
+                f"📦 {human_size(done)} / {human_size(total)}"
+            )
+        except Exception:
+            pass
+
+    await FastDownloader.download(url, dest, prog)
+    Registry.add_file(fid, {
+        "url": url, "name": dest.name, "path": str(dest),
+        "size": dest.stat().st_size, "downloaded": datetime.now().isoformat(),
+        "searches": 0,
+    })
+    return dest, fid
+
+# ================= SEARCH RUNNER =================
+async def run_search_on_files(client, message, entries: List[Tuple[int, Path, str]], terms: List[str]):
+    total_files, total_terms = len(entries), len(terms)
+    total_searches = total_files * total_terms
+    status = await message.reply("⚡ Starting...")
+    all_results, total_matches = [], 0
+    run_id = str(uuid.uuid4())[:6]
+
+    try:
+        counter = 0
+        for (fidx, fpath, fid) in entries:
+            searcher = FastFileSearcher(str(fpath))
+            for term in terms:
+                counter += 1
+                try:
+                    await status.edit_text(
+                        f"🔍 Searching\n📁 {fidx}/{total_files}\n"
+                        f"🔍 `{term}`\n📊 {counter}/{total_searches}"
+                    )
+                except Exception:
+                    pass
+
+                count, matches = await searcher.search_parallel(term)
+                total_matches += count
+
+                if count > 0:
+                    safe = re.sub(r"[^A-Za-z0-9._-]", "_", term)[:30]
+                    out = RESULTS_DIR / f"r_{run_id}_f{fidx}_{safe}.txt"
+                    async with aiofiles.open(out, "wb") as f:
+                        header = (f"=== File: {fid} ===\n=== Term: {term} ===\n"
+                                  f"=== Matches: {count} ===\n\n").encode()
+                        await f.write(header)
+                        for m in matches[:MAX_RESULT_LINES]:
+                            await f.write(m + b"\n")
+                    all_results.append(out)
+                    try:
+                        await message.reply_document(out,
+                            caption=f"📄 File {fidx} | `{term}` | {count:,} matches")
+                    except Exception as e:
+                        await message.reply(f"⚠️ Send failed for `{term}`: {e} (in ZIP)")
+
+        if all_results:
+            try:
+                await status.edit_text("🗜 Creating ZIP...")
+            except Exception:
+                pass
+            zips = split_file_into_zips(all_results, f"search_{run_id}")
+            for i, z in enumerate(zips, 1):
+                await message.reply_document(z, caption=f"🗜 ZIP Part {i}/{len(zips)}")
+
+        Registry.add_history({
+            "terms": terms, "files": total_files,
+            "matches": total_matches,
+            "result_paths": [str(p) for p in all_results],
+        })
+
+        try:
+            await status.edit_text(
+                f"✅ Complete\n📁 {total_files} files\n🔍 {total_terms} terms\n"
+                f"💥 {total_matches:,} matches\n📦 {len(all_results)} result files"
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            await status.edit_text(f"❌ Error: {e}")
+        except Exception:
+            await message.reply(f"❌ Error: {e}")
+
+# ================= COMMANDS =================
 @app.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
+async def cmd_start(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
-        await message.reply("❌ Unauthorized")
-        return
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Single Search", callback_data="single")],
-        [InlineKeyboardButton("📁 Multi Files + Multi Terms", callback_data="multi_both")],
-        [InlineKeyboardButton("🧹 Clean Files", callback_data="clean")],
-        [InlineKeyboardButton("📊 Status", callback_data="status")]
+        return await message.reply("❌ Unauthorized")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 New Search (URL)", callback_data="single"),
+         InlineKeyboardButton("📁 Multi Files + Terms", callback_data="multi_both")],
+        [InlineKeyboardButton("🗂 Saved Files", callback_data="list_files"),
+         InlineKeyboardButton("♻️ Recheck Saved", callback_data="recheck_menu")],
+        [InlineKeyboardButton("📜 History", callback_data="history"),
+         InlineKeyboardButton("🧹 Clean Results", callback_data="clean")],
+        [InlineKeyboardButton("📊 Status", callback_data="status")],
     ])
-    
     await message.reply(
-        "⚡ **Ultimate File Search Bot**\n\n"
-        "**Features:**\n"
-        "• Multiple files search\n"
-        "• Multiple terms search\n"
-        "• Combined multi-file + multi-term\n"
-        "• Memory-mapped parallel engine\n"
-        "• Auto-delete old files\n"
-        "• Live progress updates\n\n"
+        "⚡ **Persistent File Search Bot**\n\n"
+        "• Files saved forever (no auto-delete)\n"
+        "• Re-search saved files instantly (no redownload)\n"
+        "• Results delivered as ZIP\n\n"
         "**Commands:**\n"
-        "/search - Single search\n"
-        "/multisearch - Multi files + terms\n"
-        "/clean - Delete temp files\n"
-        "/status - System status\n\n"
-        "Or use buttons below:",
-        reply_markup=keyboard
+        "/search — Single URL search\n"
+        "/multisearch — Multi files + multi terms\n"
+        "/files — List saved files\n"
+        "/recheck — Re-search a saved file\n"
+        "/allfiles — Search ALL saved files\n"
+        "/history — View search history\n"
+        "/clean — Clean results\n"
+        "/status — System status",
+        reply_markup=kb
     )
 
 @app.on_message(filters.command("search"))
-async def search_command(client: Client, message: Message):
+async def cmd_search(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
-        await message.reply("❌ Unauthorized")
-        return
-    
-    user_states[message.from_user.id] = {
-        "state": "awaiting_url",
-        "mode": "single"
-    }
-    await message.reply("📎 Send me the direct download link:")
+        return await message.reply("❌ Unauthorized")
+    user_states[message.from_user.id] = {"state": "awaiting_url", "mode": "single"}
+    await message.reply("📎 Send URL (or saved file id / name):")
 
 @app.on_message(filters.command("multisearch"))
-async def multisearch_command(client: Client, message: Message):
+async def cmd_multisearch(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
-        await message.reply("❌ Unauthorized")
-        return
-    
-    user_states[message.from_user.id] = {
-        "state": "awaiting_urls",
-        "urls": [],
-        "mode": "multi_both"
-    }
-    
-    await message.reply(
-        "📎 **MULTI-FILE + MULTI-TERM SEARCH**\n\n"
-        "**Step 1:** Send download links (one per line)\n\n"
-        "Example:\n"
-        "https://example.com/file1.txt\n"
-        "https://example.com/file2.txt\n"
-        "https://example.com/file3.txt\n\n"
-        "Type /done when finished"
-    )
+        return await message.reply("❌ Unauthorized")
+    user_states[message.from_user.id] = {"state": "awaiting_urls", "urls": [], "mode": "multi_both"}
+    await message.reply("📎 Send URLs (one per line). /done when finished.\n"
+                        "Already-saved URLs are reused automatically.")
 
-@app.on_message(filters.command("done"))
-async def done_command(client: Client, message: Message):
+@app.on_message(filters.command("files"))
+async def cmd_files(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
-        await message.reply("❌ Unauthorized")
-        return
-    
-    user_id = message.from_user.id
-    state_data = user_states.get(user_id, {})
-    
-    # Check if we're in URL collection mode
-    if state_data.get("state") == "awaiting_urls":
-        urls = state_data.get("urls", [])
-        
-        if urls:
-            # Move to terms collection
-            user_states[user_id] = {
-                "state": "awaiting_terms",
-                "urls": urls,
-                "terms": [],
-                "mode": "multi_both"
-            }
-            
-            await message.reply(
-                f"✅ Received {len(urls)} files\n\n"
-                "**Step 2:** Send search terms (one per line)\n\n"
-                "Example:\n"
-                "password\n"
-                "admin\n"
-                "email\n"
-                "api_key\n\n"
-                "Type /done when finished"
-            )
-        else:
-            await message.reply("❌ No URLs received. Send links first.")
-    
-    # Check if we're in terms collection mode
-    elif state_data.get("state") == "awaiting_terms":
-        terms = state_data.get("terms", [])
-        urls = state_data.get("urls", [])
-        
-        if terms:
-            # START THE SEARCH!
-            total_searches = len(urls) * len(terms)
-            
-            await message.reply(
-                f"✅ Received {len(terms)} search terms\n\n"
-                f"📁 Files: {len(urls)}\n"
-                f"🔍 Terms: {len(terms)}\n"
-                f"🔢 Total searches: {len(urls)} × {len(terms)} = {total_searches}\n\n"
-                "⚡ Starting search... This may take a while.\n"
-                "📊 Progress will be shown live."
-            )
-            
-            # Clear the state before processing
-            user_states.pop(user_id, None)
-            
-            # Start the multi-search
-            await process_multi_search(client, message, urls, terms)
-        else:
-            await message.reply("❌ No search terms received. Send terms first.")
-    
-    else:
-        await message.reply(
-            "ℹ️ No pending operation.\n\n"
-            "Use /multisearch to start a new multi-file search."
-        )
+        return await message.reply("❌ Unauthorized")
+    files = Registry.all_files()
+    if not files:
+        return await message.reply("📂 No saved files.")
+    lines = [f"🗂 **Saved Files ({len(files)})**\n"]
+    for fid, m in files.items():
+        ok = "✅" if Path(m["path"]).exists() else "❌"
+        lines.append(f"{ok} `{fid}` | {m.get('name','?')} | {human_size(m.get('size',0))}")
+    lines.append("\n💡 Reuse: `/recheck <id>`")
+    await message.reply("\n".join(lines))
+
+@app.on_message(filters.command("recheck"))
+async def cmd_recheck(client: Client, message: Message):
+    if message.from_user.id != ALLOWED_USER_ID:
+        return await message.reply("❌ Unauthorized")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        files = Registry.all_files()
+        if not files:
+            return await message.reply("📂 No saved files.")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📄 {fid} — {m['name'][:20]}", callback_data=f"recheck:{fid}")]
+            for fid, m in list(files.items())[:20]
+        ])
+        return await message.reply("♻️ Pick a file:", reply_markup=kb)
+    fid = parts[1].strip()
+    meta = Registry.get_file(fid)
+    if not meta:
+        return await message.reply(f"❌ File `{fid}` not found.")
+    user_states[message.from_user.id] = {
+        "state": "awaiting_terms_for_recheck", "file_ids": [fid],
+        "terms": [], "mode": "recheck"
+    }
+    await message.reply(f"♻️ Recheck `{fid}` — {meta['name']}\nSend terms, then /done")
+
+@app.on_message(filters.command("allfiles"))
+async def cmd_allfiles(client: Client, message: Message):
+    if message.from_user.id != ALLOWED_USER_ID:
+        return await message.reply("❌ Unauthorized")
+    files = Registry.all_files()
+    if not files:
+        return await message.reply("📂 No saved files.")
+    user_states[message.from_user.id] = {
+        "state": "awaiting_terms_allfiles", "file_ids": list(files.keys()),
+        "terms": [], "mode": "allfiles"
+    }
+    await message.reply(f"🌐 Search across ALL {len(files)} saved files.\nSend terms, then /done")
+
+@app.on_message(filters.command("history"))
+async def cmd_history(client: Client, message: Message):
+    if message.from_user.id != ALLOWED_USER_ID:
+        return await message.reply("❌ Unauthorized")
+    hist = Registry.all_history()
+    if not hist:
+        return await message.reply("📜 No history.")
+    lines = [f"📜 **Recent ({len(hist)})**\n"]
+    for rid, h in list(hist.items())[-15:][::-1]:
+        lines.append(f"`{rid}` | {h['time'][:19]} | {h.get('matches',0):,} matches")
+    await message.reply("\n".join(lines))
 
 @app.on_message(filters.command("clean"))
-async def clean_command(client: Client, message: Message):
+async def cmd_clean(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
-        await message.reply("❌ Unauthorized")
-        return
-    
-    deleted = 0
-    freed_space = 0
-    
-    for file in TEMP_DIR.iterdir():
-        if file.is_file():
-            size = file.stat().st_size
-            file.unlink(missing_ok=True)
-            deleted += 1
-            freed_space += size
-    
-    await message.reply(
-        f"🧹 **Cleanup Complete**\n\n"
-        f"🗑 Deleted: {deleted} files\n"
-        f"💾 Freed: {freed_space / (1024*1024):.1f}MB"
-    )
+        return await message.reply("❌ Unauthorized")
+    deleted = freed = 0
+    for d in (RESULTS_DIR, ZIP_DIR):
+        for f in d.iterdir():
+            if f.is_file():
+                freed += f.stat().st_size
+                f.unlink(missing_ok=True)
+                deleted += 1
+    await message.reply(f"🧹 Cleaned {deleted} files ({human_size(freed)})\n"
+                        f"✅ Source files preserved.")
 
 @app.on_message(filters.command("status"))
-async def status_command(client: Client, message: Message):
+async def cmd_status(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
-        await message.reply("❌ Unauthorized")
-        return
-    
-    cpu_count = mp.cpu_count()
-    stat = os.statvfs(TEMP_DIR)
-    free_space = (stat.f_bavail * stat.f_frsize) / (1024**3)
-    
-    temp_files = list(TEMP_DIR.iterdir())
-    total_size = sum(f.stat().st_size for f in temp_files if f.is_file())
-    
+        return await message.reply("❌ Unauthorized")
+    files = Registry.all_files()
+    total = sum(Path(m["path"]).stat().st_size for m in files.values() if Path(m["path"]).exists())
+    stat = os.statvfs(BASE_DIR)
+    free = stat.f_bavail * stat.f_frsize
     await message.reply(
-        f"📊 **System Status**\n\n"
-        f"🖥 **CPU Cores:** {cpu_count}\n"
-        f"💿 **Free Disk:** {free_space:.1f}GB\n"
-        f"📁 **Temp Files:** {len(temp_files)}\n"
-        f"💾 **Temp Size:** {total_size / (1024*1024):.1f}MB\n"
-        f"⚡ **Engine:** Memory-mapped parallel\n"
-        f"🗑 **Auto-delete:** 1 hour\n"
-        f"📦 **Chunk Size:** 128MB\n"
-        f"🔢 **Max Workers:** {MAX_WORKERS}"
+        f"📊 **Status**\n"
+        f"🗂 Saved: {len(files)} ({human_size(total)})\n"
+        f"📜 History: {len(Registry.all_history())}\n"
+        f"💿 Free: {human_size(free)}\n"
+        f"📂 Data dir: `{BASE_DIR}`\n"
+        f"🗑 Auto-delete: OFF"
     )
 
+# ================= MESSAGE HANDLER =================
 @app.on_message(filters.text & filters.private)
-async def handle_messages(client: Client, message: Message):
+async def handle_text(client: Client, message: Message):
     if message.from_user.id != ALLOWED_USER_ID:
-        await message.reply("❌ Unauthorized")
+        return await message.reply("❌ Unauthorized")
+    if message.text.startswith("/"):
         return
-    
-    # Don't process if it's a command
-    if message.text.startswith('/'):
-        return
-    
-    user_id = message.from_user.id
-    state_data = user_states.get(user_id, {})
-    state = state_data.get("state")
-    mode = state_data.get("mode", "single")
-    
+
+    uid = message.from_user.id
+    sd = user_states.get(uid, {})
+    state = sd.get("state")
+    mode = sd.get("mode", "single")
+
     if state == "awaiting_url":
-        user_states[user_id] = {
-            "state": "awaiting_search_term",
-            "url": message.text.strip(),
-            "mode": mode
-        }
-        await message.reply("🔍 Now send the search term:")
-    
-    elif state == "awaiting_urls":
-        # Add URLs
-        urls = state_data.get("urls", [])
-        new_urls = [url.strip() for url in message.text.split('\n') if url.strip()]
-        urls.extend(new_urls)
-        
-        user_states[user_id] = {
-            "state": "awaiting_urls",
-            "urls": urls,
-            "mode": mode
-        }
-        
-        await message.reply(
-            f"✅ Added {len(new_urls)} URLs (Total: {len(urls)})\n"
-            "Send more or type /done to continue"
-        )
-    
-    elif state == "awaiting_terms":
-        # Add search terms
-        terms = state_data.get("terms", [])
-        new_terms = [term.strip() for term in message.text.split('\n') if term.strip()]
-        terms.extend(new_terms)
-        
-        user_states[user_id] = {
-            "state": "awaiting_terms",
-            "urls": state_data.get("urls", []),
-            "terms": terms,
-            "mode": mode
-        }
-        
-        await message.reply(
-            f"✅ Added {len(new_terms)} terms (Total: {len(terms)})\n"
-            "Send more or type /done to start search"
-        )
-    
-    elif state == "awaiting_search_term":
-        search_term = message.text.strip()
-        
-        if mode == "single":
-            url = state_data.get("url")
-            user_states.pop(user_id, None)
-            await process_single_search(client, message, url, search_term)
-        
-        elif mode == "multi_both":
-            terms = state_data.get("terms", [search_term])
-            urls = state_data.get("urls", [])
-            user_states.pop(user_id, None)
-            await process_multi_search(client, message, urls, terms)
+        raw = message.text.strip()
+        reuse = Registry.get_file(raw)
+        if reuse:
+            user_states[uid] = {"state": "awaiting_search_term", "file_id": raw, "mode": "single_saved"}
+            return await message.reply(f"♻️ Reusing `{raw}`. Send search term:")
+        reuse_by_name = Registry.find_by_name(raw)
+        if reuse_by_name:
+            fid, meta = reuse_by_name
+            user_states[uid] = {"state": "awaiting_search_term", "file_id": fid, "mode": "single_saved"}
+            return await message.reply(f"♻️ Reusing `{fid}`. Send search term:")
+        user_states[uid] = {"state": "awaiting_search_term", "url": raw, "mode": "single"}
+        return await message.reply("🔍 Send the search term:")
 
-async def process_single_search(client, message, url, search_term):
-    """Single file, single term"""
-    status_msg = await message.reply("⚡ Starting search...")
-    
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        download_path = TEMP_DIR / f"download_{message.from_user.id}_{timestamp}.txt"
-        output_path = TEMP_DIR / f"results_{message.from_user.id}_{timestamp}.txt"
-        
-        # Download
-        downloader = FastDownloader()
-        async def download_progress(downloaded, total):
-            percent = (downloaded / total) * 100
-            try:
-                await status_msg.edit_text(
-                    f"⬇️ **Downloading:** {percent:.1f}%\n"
-                    f"📦 {downloaded / (1024*1024):.1f}MB / {total / (1024*1024):.1f}MB"
-                )
-            except:
-                pass
-        
-        await downloader.download_with_progress(url, download_path, download_progress)
-        
-        # Search
-        await status_msg.edit_text("🔍 Searching...")
-        searcher = FastFileSearcher(str(download_path))
-        
-        async def search_progress(completed, total):
-            try:
-                await status_msg.edit_text(
-                    f"🔍 **Searching...**\n"
-                    f"📊 Progress: {completed}/{total} chunks"
-                )
-            except:
-                pass
-        
-        start_time = datetime.now()
-        matches_count, matches = await searcher.search_parallel(search_term, search_progress)
-        search_time = (datetime.now() - start_time).total_seconds()
-        
-        if matches_count > 0:
-            async with aiofiles.open(output_path, 'wb') as f:
-                for match in matches[:MAX_RESULT_LINES]:
-                    await f.write(match + b'\n')
-            
-            # Send in smaller chunks if file is large
-            file_size = os.path.getsize(output_path)
-            if file_size > 40 * 1024 * 1024:  # >40MB
-                parts = split_file(output_path, 40 * 1024 * 1024)
-                for part_idx, part_path in enumerate(parts, 1):
-                    await message.reply_document(
-                        part_path,
-                        caption=f"📄 Part {part_idx}/{len(parts)} | {matches_count:,} matches\n⚡ {search_time:.2f}s"
-                    )
-                    asyncio.create_task(FileCleaner.schedule_deletion(part_path, 300))
-            else:
-                await message.reply_document(
-                    output_path,
-                    caption=f"📄 Found {matches_count:,} matches\n⚡ {search_time:.2f}s"
-                )
-            
-            asyncio.create_task(FileCleaner.schedule_deletion(output_path, 300))
+    if state == "awaiting_urls":
+        urls = sd.get("urls", [])
+        new = [u.strip() for u in message.text.split("\n") if u.strip()]
+        urls.extend(new)
+        user_states[uid] = {"state": "awaiting_urls", "urls": urls, "mode": mode}
+        return await message.reply(f"✅ +{len(new)} URLs (Total {len(urls)})\nSend more or /done")
+
+    if state == "awaiting_terms":
+        terms = sd.get("terms", [])
+        new = [t.strip() for t in message.text.split("\n") if t.strip()]
+        terms.extend(new)
+        user_states[uid] = {**sd, "terms": terms}
+        return await message.reply(f"✅ +{len(new)} terms (Total {len(terms)})\nSend more or /done")
+
+    if state in ("awaiting_terms_for_recheck", "awaiting_terms_allfiles"):
+        terms = sd.get("terms", [])
+        new = [t.strip() for t in message.text.split("\n") if t.strip()]
+        terms.extend(new)
+        user_states[uid] = {**sd, "terms": terms}
+        return await message.reply(f"✅ +{len(new)} terms (Total {len(terms)})\nSend more or /done")
+
+    if state == "awaiting_search_term":
+        term = message.text.strip()
+        user_states.pop(uid, None)
+        if mode == "single_saved":
+            await process_single_saved(client, message, sd["file_id"], term)
         else:
-            await status_msg.edit_text(f"❌ No matches for '{search_term}'")
-        
-        asyncio.create_task(FileCleaner.schedule_deletion(download_path, 300))
-        await status_msg.delete()
-        
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+            await process_single(client, message, sd["url"], term)
 
-async def process_multi_search(client, message, urls, terms):
-    """Multiple files + Multiple terms with live progress"""
-    total_files = len(urls)
-    total_terms = len(terms)
-    total_searches = total_files * total_terms
-    
-    # Create a unique progress message
-    progress_msg = await message.reply(
-        f"⚡ **MULTI-SEARCH STARTED**\n\n"
-        f"📁 Files: {total_files}\n"
-        f"🔍 Terms: {total_terms}\n"
-        f"🔢 Total searches: {total_searches}\n\n"
-        f"⬇️ Downloading files..."
-    )
-    
+# ================= DONE HANDLER =================
+@app.on_message(filters.command("done"))
+async def cmd_done(client: Client, message: Message):
+    if message.from_user.id != ALLOWED_USER_ID:
+        return await message.reply("❌ Unauthorized")
+    uid = message.from_user.id
+    sd = user_states.get(uid, {})
+    state = sd.get("state")
+
+    if state == "awaiting_urls":
+        urls = sd.get("urls", [])
+        if not urls:
+            return await message.reply("❌ No URLs.")
+        user_states[uid] = {"state": "awaiting_terms", "urls": urls, "terms": [], "mode": "multi_both"}
+        return await message.reply(f"✅ {len(urls)} files.\n\nSend search terms (one per line), /done when finished.")
+
+    if state == "awaiting_terms":
+        terms = sd.get("terms", [])
+        urls = sd.get("urls", [])
+        if not terms:
+            return await message.reply("❌ No terms.")
+        user_states.pop(uid, None)
+        return await process_multi(client, message, urls, terms)
+
+    if state in ("awaiting_terms_for_recheck", "awaiting_terms_allfiles"):
+        terms = sd.get("terms", [])
+        file_ids = sd.get("file_ids", [])
+        if not terms:
+            return await message.reply("❌ No terms.")
+        user_states.pop(uid, None)
+        return await process_saved_batch(client, message, file_ids, terms)
+
+    await message.reply("ℹ️ Nothing pending.")
+
+# ================= PROCESSORS =================
+async def process_single(client, message, url, term):
+    status = await message.reply("⚡ Preparing...")
     try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        downloaded_files = []
-        downloader = FastDownloader()
-        
-        # Download all files with progress
+        path, fid = await download_or_reuse(url, 1, status)
+        searcher = FastFileSearcher(str(path))
+        count, matches = await searcher.search_parallel(term)
+        if count == 0:
+            return await status.edit_text(f"❌ No matches for `{term}`")
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", term)[:30]
+        out = RESULTS_DIR / f"single_{fid}_{safe}.txt"
+        async with aiofiles.open(out, "wb") as f:
+            await f.write(f"=== {fid} ===\n=== {term} ===\n=== {count} ===\n\n".encode())
+            for m in matches[:MAX_RESULT_LINES]:
+                await f.write(m + b"\n")
+        await message.reply_document(out, caption=f"📄 `{term}` | {count:,} matches")
+        zips = split_file_into_zips([out], f"single_{fid}_{safe}")
+        for i, z in enumerate(zips, 1):
+            await message.reply_document(z, caption=f"🗜 ZIP {i}/{len(zips)}")
+        Registry.add_history({"terms": [term], "files": 1, "matches": count,
+                              "result_paths": [str(out)]})
+        await status.delete()
+    except Exception as e:
+        await status.edit_text(f"❌ Error: {e}")
+
+async def process_single_saved(client, message, file_id, term):
+    meta = Registry.get_file(file_id)
+    if not meta or not Path(meta["path"]).exists():
+        return await message.reply("❌ Saved file missing.")
+    return await process_single(client, message, meta["url"], term)
+
+async def process_multi(client, message, urls, terms):
+    status = await message.reply("⚡ Preparing downloads...")
+    entries, reused = [], 0
+    try:
         for i, url in enumerate(urls, 1):
-            download_path = TEMP_DIR / f"download_{message.from_user.id}_{timestamp}_file{i}.txt"
-            
-            await progress_msg.edit_text(
-                f"⬇️ **Downloading file {i}/{total_files}**\n"
-                f"📊 Progress: {i}/{total_files}\n"
-                f"📁 File: {url[:50]}..."
-            )
-            
-            await downloader.download_with_progress(url, download_path)
-            downloaded_files.append((i, download_path))
-            
-            # Schedule deletion
-            asyncio.create_task(FileCleaner.schedule_deletion(download_path, 1800))
-        
-        # Search all files for all terms
-        search_count = 0
-        total_matches_all = 0
-        
-        for file_idx, file_path in downloaded_files:
-            searcher = FastFileSearcher(str(file_path))
-            
-            for term_idx, term in enumerate(terms, 1):
-                search_count += 1
-                
-                # Update progress
-                await progress_msg.edit_text(
-                    f"🔍 **Searching...**\n\n"
-                    f"📁 File: {file_idx}/{total_files}\n"
-                    f"🔍 Term: '{term}'\n"
-                    f"📊 Overall: {search_count}/{total_searches}\n"
-                    f"📈 Term: {term_idx}/{total_terms}\n"
-                    f"⏳ Please wait..."
-                )
-                
-                matches_count, matches = await searcher.search_parallel(term)
-                total_matches_all += matches_count
-                
-                if matches_count > 0:
-                    # Create output file
-                    safe_term = term.replace('/', '_').replace('\\', '_').replace(':', '_')[:30]
-                    output_path = TEMP_DIR / f"results_{message.from_user.id}_{timestamp}_file{file_idx}_term_{safe_term}.txt"
-                    
-                    # Write header
-                    header = f"=== File {file_idx}: {urls[file_idx-1]} ===\n"
-                    header += f"=== Search Term: {term} ===\n"
-                    header += f"=== Matches: {matches_count} ===\n\n"
-                    
-                    try:
-                        async with aiofiles.open(output_path, 'wb') as f:
-                            await f.write(header.encode('utf-8'))
-                            for match in matches[:MAX_RESULT_LINES]:
-                                await f.write(match + b'\n')
-                        
-                        file_size = os.path.getsize(output_path)
-                        
-                        # Send file in parts if too large
-                        if file_size > 40 * 1024 * 1024:  # >40MB
-                            parts = split_file(output_path, 40 * 1024 * 1024)
-                            for part_idx, part_path in enumerate(parts, 1):
-                                try:
-                                    await message.reply_document(
-                                        part_path,
-                                        caption=f"📄 File {file_idx} | '{term}' | Part {part_idx}/{len(parts)} | {matches_count:,} matches"
-                                    )
-                                except Exception as e:
-                                    await message.reply(f"⚠️ Error sending part {part_idx}: {str(e)}")
-                                asyncio.create_task(FileCleaner.schedule_deletion(part_path, 300))
-                        else:
-                            try:
-                                await message.reply_document(
-                                    output_path,
-                                    caption=f"📄 File {file_idx} | '{term}' | {matches_count:,} matches"
-                                )
-                            except Exception as e:
-                                await message.reply(f"⚠️ Error sending results for '{term}': {str(e)}")
-                        
-                        asyncio.create_task(FileCleaner.schedule_deletion(output_path, 600))
-                    except Exception as e:
-                        await message.reply(f"⚠️ Error creating results for '{term}': {str(e)}")
-                else:
-                    try:
-                        await message.reply(f"❌ File {file_idx} | '{term}': No matches")
-                    except:
-                        pass
-                
-                # Update progress after each term
-                await progress_msg.edit_text(
-                    f"🔍 **Searching...**\n\n"
-                    f"📁 File: {file_idx}/{total_files}\n"
-                    f"🔍 Term: '{term}' - ✅ Done\n"
-                    f"📊 Overall: {search_count}/{total_searches}\n"
-                    f"📈 Found: {matches_count:,} matches"
-                )
-        
-        # Final summary
-        await progress_msg.edit_text(
-            f"✅ **SEARCH COMPLETE**\n\n"
-            f"📁 Files processed: {total_files}\n"
-            f"🔍 Terms searched: {total_terms}\n"
-            f"🔢 Total searches: {total_searches}\n"
-            f"📊 Total matches: {total_matches_all:,}\n\n"
-            f"🗑 Files will auto-delete in 30 minutes\n"
-            f"📦 All results sent successfully!"
-        )
-        
+            p, fid = await download_or_reuse(url, i, status)
+            entries.append((i, p, fid))
+            if Registry.find_by_url(url):
+                reused += 1
     except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
+        return await status.edit_text(f"❌ Download error: {e}")
+    if reused:
         try:
-            await progress_msg.edit_text(error_msg)
-        except:
-            await message.reply(error_msg)
+            await status.edit_text(f"♻️ Reused {reused} saved files.")
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+    await run_search_on_files(client, message, entries, terms)
 
+async def process_saved_batch(client, message, file_ids, terms):
+    entries = []
+    for i, fid in enumerate(file_ids, 1):
+        meta = Registry.get_file(fid)
+        if meta and Path(meta["path"]).exists():
+            entries.append((i, Path(meta["path"]), fid))
+    if not entries:
+        return await message.reply("❌ No valid saved files.")
+    await run_search_on_files(client, message, entries, terms)
+
+# ================= CALLBACKS =================
 @app.on_callback_query()
-async def handle_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await callback_query.answer("❌ Unauthorized", show_alert=True)
-        return
-    
-    action = callback_query.data
-    
-    if action == "single":
-        user_states[user_id] = {"state": "awaiting_url", "mode": "single"}
-        await callback_query.message.reply("📎 Send me the direct download link:")
-    
-    elif action == "multi_both":
-        user_states[user_id] = {
-            "state": "awaiting_urls",
-            "urls": [],
-            "mode": "multi_both"
-        }
-        await callback_query.message.reply(
-            "📎 Send download links (one per line):\n"
-            "Type /done when finished"
-        )
-    
-    elif action == "clean":
-        deleted = 0
-        freed_space = 0
-        for file in TEMP_DIR.iterdir():
-            if file.is_file():
-                size = file.stat().st_size
-                file.unlink(missing_ok=True)
-                deleted += 1
-                freed_space += size
-        
-        await callback_query.message.reply(
-            f"🧹 **Cleanup Complete**\n"
-            f"🗑 Deleted: {deleted} files\n"
-            f"💾 Freed: {freed_space / (1024*1024):.1f}MB"
-        )
-    
-    elif action == "status":
-        cpu_count = mp.cpu_count()
-        stat = os.statvfs(TEMP_DIR)
-        free_space = (stat.f_bavail * stat.f_frsize) / (1024**3)
-        
-        temp_files = list(TEMP_DIR.iterdir())
-        total_size = sum(f.stat().st_size for f in temp_files if f.is_file())
-        
-        await callback_query.message.reply(
-            f"📊 **System Status**\n\n"
-            f"🖥 **CPU Cores:** {cpu_count}\n"
-            f"💿 **Free Disk:** {free_space:.1f}GB\n"
-            f"📁 **Temp Files:** {len(temp_files)}\n"
-            f"💾 **Temp Size:** {total_size / (1024*1024):.1f}MB\n"
-            f"🗑 **Auto-delete:** 1 hour\n"
-            f"📦 **Max File Size:** Unlimited\n"
-            f"📊 **Max Results per file:** {MAX_RESULT_LINES:,}"
-        )
-    
-    await callback_query.answer()
+async def on_cb(client: Client, q: CallbackQuery):
+    uid = q.from_user.id
+    if uid != ALLOWED_USER_ID:
+        return await q.answer("❌ Unauthorized", show_alert=True)
+    d = q.data
 
-def split_file(file_path: Path, max_size: int) -> List[Path]:
-    """Split large file into smaller parts"""
-    parts = []
-    file_size = os.path.getsize(file_path)
-    num_parts = (file_size + max_size - 1) // max_size
-    
-    try:
-        with open(file_path, 'rb') as f:
-            for i in range(num_parts):
-                part_path = file_path.parent / f"{file_path.stem}_part{i+1}.txt"
-                with open(part_path, 'wb') as part_file:
-                    remaining = min(max_size, file_size - i * max_size)
-                    while remaining > 0:
-                        chunk = f.read(min(READ_BUFFER, remaining))
-                        if not chunk:
-                            break
-                        part_file.write(chunk)
-                        remaining -= len(chunk)
-                parts.append(part_path)
-    except Exception as e:
-        print(f"Error splitting file: {e}")
-    
-    return parts
+    if d == "single":
+        user_states[uid] = {"state": "awaiting_url", "mode": "single"}
+        await q.message.reply("📎 Send URL or saved file id:")
+    elif d == "multi_both":
+        user_states[uid] = {"state": "awaiting_urls", "urls": [], "mode": "multi_both"}
+        await q.message.reply("📎 Send URLs (one per line). /done when finished.")
+    elif d == "list_files":
+        files = Registry.all_files()
+        if not files:
+            await q.message.reply("📂 No saved files.")
+        else:
+            lines = [f"🗂 **{len(files)} files**\n"]
+            for fid, m in files.items():
+                ok = "✅" if Path(m["path"]).exists() else "❌"
+                lines.append(f"{ok} `{fid}` | {m['name']} | {human_size(m.get('size',0))}")
+            await q.message.reply("\n".join(lines))
+    elif d == "recheck_menu":
+        files = Registry.all_files()
+        if not files:
+            await q.message.reply("📂 No saved files.")
+        else:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📄 {fid} — {m['name'][:20]}", callback_data=f"recheck:{fid}")]
+                for fid, m in list(files.items())[:20]
+            ])
+            await q.message.reply("♻️ Pick a file:", reply_markup=kb)
+    elif d.startswith("recheck:"):
+        fid = d.split(":", 1)[1]
+        meta = Registry.get_file(fid)
+        if not meta:
+            await q.answer("Not found", show_alert=True)
+        else:
+            user_states[uid] = {"state": "awaiting_terms_for_recheck",
+                                "file_ids": [fid], "terms": [], "mode": "recheck"}
+            await q.message.reply(f"♻️ Recheck `{fid}`\nSend terms, then /done")
+    elif d == "history":
+        hist = Registry.all_history()
+        if not hist:
+            await q.message.reply("📜 No history.")
+        else:
+            lines = [f"📜 **{len(hist)} searches**\n"]
+            for rid, h in list(hist.items())[-15:][::-1]:
+                lines.append(f"`{rid}` | {h['time'][:19]} | {h.get('matches',0):,} matches")
+            await q.message.reply("\n".join(lines))
+    elif d == "clean":
+        deleted = freed = 0
+        for dd in (RESULTS_DIR, ZIP_DIR):
+            for f in dd.iterdir():
+                if f.is_file():
+                    freed += f.stat().st_size
+                    f.unlink(missing_ok=True)
+                    deleted += 1
+        await q.message.reply(f"🧹 Cleaned {deleted} files ({human_size(freed)})\n"
+                              f"✅ Sources preserved.")
+    elif d == "status":
+        files = Registry.all_files()
+        total = sum(Path(m["path"]).stat().st_size for m in files.values() if Path(m["path"]).exists())
+        stat = os.statvfs(BASE_DIR)
+        free = stat.f_bavail * stat.f_frsize
+        await q.message.reply(
+            f"📊 **Status**\n🗂 Saved: {len(files)} ({human_size(total)})\n"
+            f"📜 History: {len(Registry.all_history())}\n"
+            f"💿 Free: {human_size(free)}\n📂 Data: `{BASE_DIR}`"
+        )
+    await q.answer()
 
+# ================= RUN =================
 if __name__ == "__main__":
-    print("⚡ Ultimate Multi-File Search Bot starting...")
-    print(f"CPU Cores: {mp.cpu_count()}")
-    print(f"Max Workers: {MAX_WORKERS}")
-    print(f"Chunk Size: {CHUNK_SIZE / (1024*1024):.0f}MB")
-    print(f"Auto-delete: Files older than {MAX_FILE_AGE/60:.0f} minutes")
-    
-    # Start cleanup task
-    loop = asyncio.get_event_loop()
-    loop.create_task(FileCleaner.cleanup_old_files())
-    
+    print(f"⚡ Bot starting...")
+    print(f"CPU: {mp.cpu_count()} | Workers: {MAX_WORKERS}")
+    print(f"Data dir: {BASE_DIR}")
+    print(f"Volume detected: {'YES' if os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') else 'NO'}")
     app.run()
